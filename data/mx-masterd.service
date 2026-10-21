@@ -1,0 +1,12 @@
+[Unit]
+Description=mx-master-linux button and gesture daemon
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=@BIN@/mx-masterd
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="body" x1="0.2" y1="0" x2="0.8" y2="1">
+      <stop offset="0" stop-color="#626873"/>
+      <stop offset="0.5" stop-color="#3d424a"/>
+      <stop offset="1" stop-color="#23262b"/>
+    </linearGradient>
+    <linearGradient id="shelf" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2a2d33"/>
+      <stop offset="1" stop-color="#17191c"/>
+    </linearGradient>
+    <linearGradient id="metal" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#868d95"/>
+      <stop offset="0.5" stop-color="#eef1f3"/>
+      <stop offset="1" stop-color="#868d95"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.25"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="badge" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#62a0ea"/>
+      <stop offset="1" stop-color="#1c71d8"/>
+    </linearGradient>
+  </defs>
+
+  <ellipse cx="60" cy="118" rx="42" ry="6" fill="#000" opacity="0.25"/>
+
+  <!-- one silhouette: narrow front, wide back, thumb rest flaring out on the left -->
+  <path id="shape" d="M66 6 C88 6 102 26 104 52 C106 78 100 98 88 108 C78 116 62 117 48 114
+           C34 112 20 108 15 98 C10 88 14 78 24 74 C30 72 33 68 33 60 C34 32 45 6 66 6 Z"
+        fill="url(#body)" stroke="#7b818b" stroke-width="2"/>
+  <!-- thumb rest, darker -->
+  <path d="M33 62 C33 70 29 73 24 75 C15 79 12 88 16 97 C21 107 34 111 48 113
+           C40 104 37 92 37 80 C37 72 35 66 33 62 Z" fill="url(#shelf)"/>
+  <!-- top highlight over the two buttons -->
+  <path d="M66 7 C87 7 101 26 103 50 C90 44 76 42 62 44 C50 46 40 50 34 55 C37 30 47 7 66 7 Z" fill="url(#sheen)"/>
+
+  <!-- split between the two main buttons -->
+  <path d="M67 8 L65 44" stroke="#15171a" stroke-width="2" stroke-linecap="round"/>
+
+  <!-- metal scroll wheel and the wheel-mode button behind it -->
+  <rect x="59" y="14" width="12" height="25" rx="6" fill="url(#metal)"/>
+  <path d="M60 20h10M60 24h10M60 28h10M60 32h10" stroke="#6b7279" stroke-width="1" opacity="0.6"/>
+  <rect x="62" y="43" width="6" height="4" rx="2" fill="#121417"/>
+
+  <!-- side thumb wheel and gesture button -->
+  <rect x="34" y="64" width="7" height="17" rx="3.5" fill="url(#metal)"/>
+  <path d="M34.5 68h6M34.5 72h6M34.5 76h6" stroke="#6b7279" stroke-width="1" opacity="0.7"/>
+  <path d="M19 90 C24 85 32 85 37 89" stroke="#565b64" stroke-width="3" stroke-linecap="round" fill="none"/>
+
+  <!-- gesture badge -->
+  <circle cx="98" cy="98" r="24" fill="url(#badge)" stroke="#ffffff" stroke-width="3"/>
+  <g stroke="#ffffff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <path d="M84 98 H112"/>
+    <path d="M90 91 L83 98 L90 105"/>
+    <path d="M106 91 L113 98 L106 105"/>
+  </g>
+</svg>

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=MX Master Settings
+GenericName=Mouse Settings
+Comment=Remap buttons and set up thumb-button gestures for Logitech MX Master mice
+Exec=@BIN@/mx-master
+Icon=dev.faruhaan.MxMaster
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=mouse;logitech;mx;master;gesture;buttons;dpi;smartshift;
+StartupNotify=true
+StartupWMClass=dev.faruhaan.MxMaster

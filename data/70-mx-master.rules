@@ -1,0 +1,5 @@
+# Lets the logged-in user talk HID++ to Logitech devices (USB receiver or Bluetooth)
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="046d", TAG+="uaccess"
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", KERNELS=="0005:046D:*", TAG+="uaccess"
+# Virtual keyboard used to send the keys that gestures and buttons map to
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"
