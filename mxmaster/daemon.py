@@ -1,24 +1,33 @@
 """Background service: applies settings to the mouse and turns diverted buttons into actions.
 
 Runs as the logged-in user (systemd user unit). It waits for the mouse, applies the
-config, and applies it again whenever the mouse reconnects or the config file changes.
+config, and applies it again whenever the mouse reconnects, the config file changes, or
+(with the GNOME Shell extension) the focused app changes to one with its own settings.
 """
 import logging
+import math
 import os
 import signal
+import subprocess
 import sys
-import time
+from pathlib import Path
+
+from gi.repository import Gio, GLib
 
 from . import actions, config, hidpp
+from .shell import Shell
 from .uinput import VirtualInput, VirtualTouchpad
 
 log = logging.getLogger("mx-masterd")
 
 DIVERT, DIVERT_VALID, RAW_XY, RAW_XY_VALID = 0x01, 0x02, 0x10, 0x20
 WHEEL_MODES = {"free": 1, "ratchet": 2, "smartshift": 2}
-SEARCH_INTERVAL = 2.0
+SEARCH_INTERVAL = 2
+CONFIG_CHECK_MS = 500
 SWIPE_START = 60  # sensor counts before the virtual fingers go down; less is a click
+RING_DEADZONE = 90  # sensor counts from the centre before a ring item is picked
 BATTERY_INTERVAL = 300
+PACKAGE_DIR = Path(__file__).resolve().parent.parent
 
 
 class Button:
@@ -27,9 +36,10 @@ class Button:
     def __init__(self, name, settings):
         self.name = name
         self.click = settings.get("click", "default")
+        self.ring = self.click == actions.RING
         self.directions = {d: settings.get(d) for d in config.DIRECTIONS}
-        self.gestures = any(actions.does_something(a) for a in self.directions.values())
-        self.swipe = actions.SWIPE in self.directions.values()
+        self.gestures = not self.ring and any(actions.does_something(a) for a in self.directions.values())
+        self.swipe = self.gestures and actions.SWIPE in self.directions.values()
         self.held = False
         self.dx = self.dy = 0
         self.done = False  # this hold already became a gesture, so release is not a click
@@ -37,6 +47,10 @@ class Button:
     @property
     def diverted(self):
         return self.gestures or actions.is_set(self.click)
+
+    @property
+    def needs_movement(self):
+        return self.gestures or self.ring
 
     def direction(self):
         if abs(self.dx) >= abs(self.dy):
@@ -49,14 +63,20 @@ class Daemon:
         self.config = config.load()
         self.config_mtime = config.mtime()
         self.device = None
+        self.device_watch = 0
+        self.available = {}  # control id -> flags2, for the connected mouse
         self.buttons = {}
         self.dpi_list = []
+        self.dpi = 1000
         self.state = {"connected": False, "pid": os.getpid()}
-        self.battery_at = 0.0
         self.output = VirtualInput()
         self.touchpad = None  # created when a button first needs it
-        self.dpi = 1000
-        self.running = True
+        self.focused_app = ""
+        self.ring_button = None  # the button holding the ring open
+        self.ring_items = []
+        self.ring_index = -1
+        self.loop = GLib.MainLoop()
+        self.shell = Shell(self.on_focus, self.on_ring_chosen)
 
     # --- device lifecycle -------------------------------------------------
 
@@ -72,14 +92,19 @@ class Daemon:
                 self.device = dev
                 log.info("Connected to %s (%s)", dev.name(), path)
                 self.apply()
+                self.device_watch = GLib.io_add_watch(dev.fd, GLib.PRIORITY_HIGH,
+                                                      GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, self.on_readable)
                 return True
             except (OSError, hidpp.HidppError) as e:
                 log.debug("Skipping %s: %s", path, e)
+                self.device = None
         return False
 
     def disconnect(self):
-        if self.touchpad:
-            self.touchpad.end()
+        self.end_gestures()
+        if self.device_watch:
+            GLib.source_remove(self.device_watch)
+            self.device_watch = 0
         if self.device:
             try:
                 self.device.close()
@@ -88,6 +113,13 @@ class Daemon:
             self.device = None
             log.info("Mouse disconnected, waiting for it")
         self.publish(connected=False)
+
+    def end_gestures(self):
+        if self.touchpad:
+            self.touchpad.end()
+        if self.ring_button:
+            self.ring_button = None
+            self.shell.hide_ring()
 
     def apply(self):
         """Push the config to the mouse. Diverts do not survive a reconnect, so this runs again then."""
@@ -103,28 +135,8 @@ class Daemon:
         if wheel.get("mode") in WHEEL_MODES and dev.feature(hidpp.SMART_SHIFT):
             threshold = 0xFF if wheel["mode"] == "ratchet" else max(1, min(254, int(wheel.get("threshold", 16))))
             dev.request(hidpp.SMART_SHIFT, 1, (WHEEL_MODES[wheel["mode"]], threshold, 0))
-
-        available = self.controls()
-        self.buttons = {}
-        for name, settings in cfg.get("buttons", {}).items():
-            cid = config.BUTTONS.get(name)
-            if cid is None or cid not in available:
-                continue
-            button = Button(name, settings or {})
-            flags = DIVERT_VALID | RAW_XY_VALID
-            if button.diverted:
-                flags |= DIVERT
-                if button.gestures:
-                    if not available[cid] & 0x01:
-                        log.warning("%s cannot report movement; gestures on it are ignored", name)
-                        button.gestures = False
-                    else:
-                        flags |= RAW_XY
-                if button.swipe and not self.touchpad:
-                    self.touchpad = VirtualTouchpad()
-                self.buttons[cid] = button
-            dev.request(hidpp.REPROG_CONTROLS_V4, 3, cid.to_bytes(2, "big") + bytes([flags, 0, 0]))
-        log.info("Applied settings; diverted: %s", ", ".join(b.name for b in self.buttons.values()) or "none")
+        self.available = self.controls()
+        self.apply_buttons()
         self.publish(
             connected=True,
             name=dev.name(),
@@ -132,25 +144,35 @@ class Daemon:
             dpi_default=dev.default_dpi() if dpi_range else None,
             dpi_range=dpi_range,
             wheel=bool(dev.feature(hidpp.SMART_SHIFT)),
-            buttons=[n for n, cid in config.BUTTONS.items() if cid in available],
-            gesture_buttons=[n for n, cid in config.BUTTONS.items() if available.get(cid, 0) & 0x01],
+            buttons=[n for n, cid in config.BUTTONS.items() if cid in self.available],
+            gesture_buttons=[n for n, cid in config.BUTTONS.items() if self.available.get(cid, 0) & 0x01],
         )
         self.update_battery()
 
-    def publish(self, **changes):
-        if not changes.get("connected", True):
-            self.state = {"connected": False, "pid": os.getpid()}
-        self.state.update(changes)
-        try:
-            config.write_state(self.state)
-        except OSError as e:
-            log.warning("Could not write the status file: %s", e)
-
-    def update_battery(self):
-        self.battery_at = time.monotonic()
-        if self.device.feature(hidpp.BATTERY_STATUS):
-            percent, charging = self.device.battery()
-            self.publish(battery=percent, charging=charging)
+    def apply_buttons(self):
+        """Divert the buttons that do something for the focused app, and give the rest back."""
+        self.end_gestures()
+        app = self.focused_app if self.focused_app in (self.config.get("apps") or {}) else None
+        self.buttons = {}
+        for name, cid in config.BUTTONS.items():
+            if cid not in self.available:
+                continue
+            button = Button(name, config.button_settings(self.config, name, app))
+            flags = DIVERT_VALID | RAW_XY_VALID
+            if button.diverted:
+                flags |= DIVERT
+                if button.needs_movement:
+                    if not self.available[cid] & 0x01:
+                        log.warning("%s cannot report movement; its gestures are ignored", name)
+                        button.gestures = button.swipe = button.ring = False
+                    else:
+                        flags |= RAW_XY
+                if button.swipe and not self.touchpad:
+                    self.touchpad = VirtualTouchpad()
+                self.buttons[cid] = button
+            self.device.request(hidpp.REPROG_CONTROLS_V4, 3, cid.to_bytes(2, "big") + bytes([flags, 0, 0]))
+        log.info("Applied settings%s; diverted: %s", f" for {app}" if app else "",
+                 ", ".join(b.name for b in self.buttons.values()) or "none")
 
     def controls(self):
         """Control id -> flags2 (bit 0: can report raw movement) for divertable controls."""
@@ -172,7 +194,45 @@ class Daemon:
             return [d for d in (400, 800, 1000, 1600, 2400, 3200, 4000) if low <= d <= high and (d - low) % step == 0]
         return list(dpi_range)
 
+    def publish(self, **changes):
+        if not changes.get("connected", True):
+            self.state = {"connected": False, "pid": os.getpid()}
+        self.state.update(changes)
+        self.state["shell"] = self.shell.available
+        self.state["focused_app"] = self.focused_app
+        try:
+            config.write_state(self.state)
+        except OSError as e:
+            log.warning("Could not write the status file: %s", e)
+
+    def update_battery(self):
+        if self.device and self.device.feature(hidpp.BATTERY_STATUS):
+            percent, charging = self.device.battery()
+            self.publish(battery=percent, charging=charging)
+
     # --- events -----------------------------------------------------------
+
+    def on_readable(self, _fd, condition):
+        if condition & (GLib.IO_HUP | GLib.IO_ERR):
+            self.disconnect()
+            return GLib.SOURCE_REMOVE
+        try:
+            while self.device:
+                while self.device.pending_events:
+                    self.handle(self.device.pending_events.pop(0))
+                data = self.device.read_report(0)
+                if data is None:
+                    break
+                if data:
+                    self.handle(data)
+        except OSError:
+            self.disconnect()
+            return GLib.SOURCE_REMOVE
+        except hidpp.HidppError as e:
+            log.warning("Mouse did not answer (%s); reconnecting", e)
+            self.disconnect()
+            return GLib.SOURCE_REMOVE
+        return GLib.SOURCE_CONTINUE if self.device else GLib.SOURCE_REMOVE
 
     def handle(self, data):
         dev = self.device
@@ -198,11 +258,15 @@ class Daemon:
             down = cid in pressed
             if down and not button.held:
                 button.held, button.dx, button.dy, button.done = True, 0, 0, False
-                if not button.gestures and button.click == "default":
+                if button.ring:
+                    self.open_ring(button)
+                elif not button.gestures and button.click == "default":
                     self.run(button, "default", down=True)  # held as long as the real button
             elif button.held and not down:
                 button.held = False
-                if self.touchpad and self.touchpad.touching:
+                if button.ring:
+                    self.release_ring(button)
+                elif self.touchpad and self.touchpad.touching:
                     self.touchpad.end()
                 elif not button.gestures and button.click == "default":
                     self.run(button, "default", down=False)
@@ -211,7 +275,11 @@ class Daemon:
 
     def on_move(self, dx, dy):
         for button in self.buttons.values():
-            if button.held and button.gestures:
+            if not button.held:
+                continue
+            if button.ring:
+                self.move_ring(button, dx, dy)
+            elif button.gestures:
                 self.on_gesture_move(button, dx, dy)
 
     def on_gesture_move(self, button, dx, dy):
@@ -239,6 +307,67 @@ class Daemon:
             button.done = True
             self.run(button, action, direction)
 
+    # --- actions ring -----------------------------------------------------
+
+    def open_ring(self, button):
+        items = list(self.config.get("ring") or [])[:actions.RING_SLOTS]
+        items += [None] * (actions.RING_SLOTS - len(items))
+        self.ring_items = items
+        self.ring_index = -1
+        shown = [(actions.label(a), actions.icon(a)) if actions.does_something(a) else ("", "") for a in items]
+        if self.shell.show_ring(shown):
+            self.ring_button = button
+        else:
+            log.warning("The actions ring needs the GNOME Shell extension, which is not running")
+
+    def move_ring(self, button, dx, dy):
+        if self.ring_button is not button:
+            return
+        button.dx += dx
+        button.dy += dy
+        index = -1
+        if math.hypot(button.dx, button.dy) >= RING_DEADZONE:
+            # 0 is straight up, counting clockwise; screen y grows downwards
+            angle = math.degrees(math.atan2(button.dx, -button.dy)) % 360
+            index = round(angle / (360 / actions.RING_SLOTS)) % actions.RING_SLOTS
+            if not actions.does_something(self.ring_items[index]):
+                index = -1
+        if index != self.ring_index:
+            self.ring_index = index
+            self.shell.highlight_ring(index)
+
+    def release_ring(self, button):
+        if self.ring_button is not button:
+            return
+        index = self.ring_index
+        self.shell.release_ring(index)
+        if index >= 0:
+            self.ring_button = None
+            self.run(button, self.ring_items[index], f"ring {actions.RING_POSITIONS[index].lower()}")
+        # Otherwise the ring stays open and the extension reports a pointer click
+
+    def on_ring_chosen(self, index):
+        button, self.ring_button = self.ring_button, None
+        if button and 0 <= index < len(self.ring_items):
+            self.run(button, self.ring_items[index], f"ring {actions.RING_POSITIONS[index].lower()}")
+
+    # --- per-app settings ---------------------------------------------------
+
+    def on_focus(self, app):
+        app = app.removesuffix(".desktop")
+        apps = self.config.get("apps") or {}
+        before = self.focused_app if self.focused_app in apps else None
+        self.focused_app = app
+        after = app if app in apps else None
+        if self.device and before != after:
+            try:
+                self.apply_buttons()
+            except (OSError, hidpp.HidppError) as e:
+                log.warning("Could not switch settings for %s: %s", app, e)
+        self.publish()
+
+    # --- running actions ------------------------------------------------------
+
     def run(self, button, action, direction="click", down=None):
         if action == "default":
             if down is not False:
@@ -256,10 +385,28 @@ class Daemon:
             self.toggle_smartshift()
         elif action == "dpi-cycle":
             self.cycle_dpi()
+        elif action == "web-search":
+            self.open_uri(actions.WEB_SEARCH_URL)
+        elif action == "assistant":
+            self.toggle_assistant()
         elif keys := actions.keys_for(action):
             self.output.press(keys)
         else:
             log.warning("Unknown action %r on %s %s", action, button.name, direction)
+
+    def open_uri(self, uri):
+        try:
+            Gio.AppInfo.launch_default_for_uri(uri, None)
+        except GLib.Error as e:
+            log.warning("Could not open %s: %s", uri, e.message)
+
+    def toggle_assistant(self):
+        if not (self.config.get("assistant") or {}).get("enabled"):
+            log.info("The AI assistant is turned off in the settings")
+            return
+        # The assistant is a single-instance app: running it again shows or hides its window
+        subprocess.Popen([sys.executable, "-m", "mxmaster.assistant"], cwd=PACKAGE_DIR,
+                         stdin=subprocess.DEVNULL, start_new_session=True)
 
     def toggle_smartshift(self):
         if self.device.feature(hidpp.SMART_SHIFT):
@@ -277,52 +424,54 @@ class Daemon:
 
     # --- main loop --------------------------------------------------------
 
-    def reload_if_changed(self):
+    def check_config(self):
         mtime = config.mtime()
-        if mtime == self.config_mtime:
-            return
-        self.config_mtime = mtime
+        if mtime != self.config_mtime:
+            self.config_mtime = mtime
+            try:
+                self.config = config.load()
+            except ValueError as e:
+                log.error("Config file is not valid JSON, keeping the old settings: %s", e)
+                return GLib.SOURCE_CONTINUE
+            log.info("Config changed")
+            if self.device:
+                try:
+                    self.apply()
+                except (OSError, hidpp.HidppError) as e:
+                    log.warning("Could not apply the new settings: %s", e)
+                    self.disconnect()
+        return GLib.SOURCE_CONTINUE
+
+    def search(self):
+        if not self.device:
+            try:
+                self.connect()
+            except (OSError, hidpp.HidppError) as e:
+                log.warning("Could not set up the mouse: %s", e)
+                self.disconnect()
+        return GLib.SOURCE_CONTINUE
+
+    def battery_tick(self):
         try:
-            self.config = config.load()
-        except ValueError as e:
-            log.error("Config file is not valid JSON, keeping the old settings: %s", e)
-            return
-        log.info("Config changed")
-        if self.device:
-            self.apply()
+            self.update_battery()
+        except (OSError, hidpp.HidppError):
+            pass
+        return GLib.SOURCE_CONTINUE
 
     def run_forever(self):
-        last_search = 0.0
         self.publish(connected=False)
-        while self.running:
-            self.reload_if_changed()
-            if not self.device:
-                if time.monotonic() - last_search >= SEARCH_INTERVAL:
-                    last_search = time.monotonic()
-                    try:
-                        self.connect()
-                    except (OSError, hidpp.HidppError) as e:
-                        log.warning("Could not set up the mouse: %s", e)
-                        self.disconnect()
-                if not self.device:
-                    time.sleep(0.5)
-                continue
-            try:
-                while self.device.pending_events:
-                    self.handle(self.device.pending_events.pop(0))
-                data = self.device.read_report(1.0)
-                if data:
-                    self.handle(data)
-                if time.monotonic() - self.battery_at > BATTERY_INTERVAL:
-                    self.update_battery()
-            except OSError:
-                self.disconnect()
-            except hidpp.HidppError as e:
-                log.warning("Mouse did not answer (%s); reconnecting", e)
-                self.disconnect()
+        self.search()
+        GLib.timeout_add_seconds(SEARCH_INTERVAL, self.search)
+        GLib.timeout_add(CONFIG_CHECK_MS, self.check_config)
+        GLib.timeout_add_seconds(BATTERY_INTERVAL, self.battery_tick)
+        self.loop.run()
+
+    def stop(self):
+        self.loop.quit()
 
     def shutdown(self):
         """Give the buttons back to the mouse so they work normally without us."""
+        self.end_gestures()
         if self.device:
             for cid in self.buttons:
                 try:
@@ -332,7 +481,6 @@ class Daemon:
             self.device.close()
         self.publish(connected=False, pid=None)
         if self.touchpad:
-            self.touchpad.end()
             self.touchpad.close()
         self.output.close()
 
@@ -344,11 +492,13 @@ def main():
     except PermissionError as e:
         sys.exit(f"No access to {e.filename}. Is the udev rule installed? See README.")
 
-    def stop(*_):
-        daemon.running = False
-
-    signal.signal(signal.SIGTERM, stop)
-    signal.signal(signal.SIGINT, stop)
+    try:
+        from gi.repository import GLibUnix
+        add_signal = GLibUnix.signal_add
+    except ImportError:  # GLib older than 2.80
+        add_signal = GLib.unix_signal_add
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        add_signal(GLib.PRIORITY_HIGH, signum, lambda: daemon.stop() or GLib.SOURCE_REMOVE)
     try:
         daemon.run_forever()
     finally:

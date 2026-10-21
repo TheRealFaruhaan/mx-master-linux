@@ -1,6 +1,8 @@
 """The settings app. It edits the config file and shows what the daemon reports; the
 daemon notices the file change and applies it, so every change takes effect at once."""
 import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -8,7 +10,7 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk  # noqa: E402
 
 from . import __version__, actions, config  # noqa: E402
 from .keycodes import CODES  # noqa: E402
@@ -30,7 +32,9 @@ WHEEL_MODES = [("smartshift", "SmartShift", "Ratchet, and spins freely when you 
                ("ratchet", "Always ratchet", "Clicks with every step"),
                ("free", "Always free-spin", "Spins without resistance")]
 CUSTOM = "custom"
-SOURCE_ICONS = Path(__file__).resolve().parent.parent / "data"  # when run from the source folder
+PACKAGE_DIR = Path(__file__).resolve().parent.parent
+SOURCE_ICONS = PACKAGE_DIR / "data"  # when run from the source folder
+ASSISTANT_ID = "dev.faruhaan.MxMaster.Assistant"
 
 MODIFIER_KEYS = [(Gdk.ModifierType.CONTROL_MASK, "KEY_LEFTCTRL"), (Gdk.ModifierType.SHIFT_MASK, "KEY_LEFTSHIFT"),
                  (Gdk.ModifierType.ALT_MASK, "KEY_LEFTALT"), (Gdk.ModifierType.SUPER_MASK, "KEY_LEFTMETA")]
@@ -42,15 +46,45 @@ MODIFIER_CODES = {CODES[n] for n in ("KEY_LEFTCTRL", "KEY_RIGHTCTRL", "KEY_LEFTS
                                      "KEY_LEFTALT", "KEY_RIGHTALT", "KEY_LEFTMETA", "KEY_RIGHTMETA")}
 
 
-def action_choices(direction=None):
-    """(value, label) pairs for an action dropdown. Directions get the swipe; clicks get Default."""
-    if direction:
+def action_choices(kind="click", direction=None, inherit=None):
+    """(value, label) pairs for an action dropdown.
+
+    kind is "click" (gets Default and the actions ring), "direction" (gets the swipe) or
+    "ring" (an item of the actions ring). With inherit, the first entry is "same as
+    everywhere" for per-app settings, and switching off is spelled "none".
+    """
+    if kind == "direction":
         choices = [(None, "Nothing"), (actions.SWIPE, actions.label(actions.SWIPE, direction))]
+    elif kind == "ring":
+        choices = [(None, "Empty")]
     else:
-        choices = [("default", "Default"), ("none", "Do nothing")]
+        choices = [("default", "Default"), ("none", "Do nothing"), (actions.RING, actions.RING_LABEL)]
+    if inherit is not None:
+        choices = [(None, f"Same as everywhere: {inherit}")] + [
+            ("none", label) if value is None else (value, label) for value, label in choices]
     choices += [(key, label) for key, (label, _) in actions.PRESETS.items()]
     choices += list(actions.SPECIAL.items())
     return choices
+
+
+def webkit_available():
+    dirs = [Path("/usr/lib/girepository-1.0"), *Path("/usr/lib").glob("*/girepository-1.0")]
+    return any((d / "WebKit-6.0.typelib").exists() for d in dirs)
+
+
+def run_assistant():
+    """Shows or hides the assistant window (it is a single-instance app)."""
+    subprocess.Popen([sys.executable, "-m", "mxmaster.assistant"], cwd=PACKAGE_DIR,
+                     stdin=subprocess.DEVNULL, start_new_session=True)
+
+
+def quit_assistant():
+    try:
+        Gio.bus_get_sync(Gio.BusType.SESSION).call_sync(
+            ASSISTANT_ID, "/" + ASSISTANT_ID.replace(".", "/"), "org.gtk.Actions", "Activate",
+            GLib.Variant("(sava{sv})", ("quit", [], {})), None, Gio.DBusCallFlags.NONE, 1000)
+    except GLib.Error:
+        pass  # not running
 
 
 class ShortcutDialog(Adw.Dialog):
@@ -136,12 +170,12 @@ def same(a, b):
 class ActionRow(Adw.ComboRow):
     """A dropdown of actions for one button click or direction."""
 
-    def __init__(self, window, title, value, on_change, default, direction=None):
+    def __init__(self, window, title, value, on_change, default, direction=None, kind=None, inherit=None):
         super().__init__(title=title, enable_search=True, use_subtitle=True)
         self.window = window
         self.on_change = on_change
         self.default = default
-        self.choices = action_choices(direction)
+        self.choices = action_choices(kind or ("direction" if direction else "click"), direction, inherit)
         self.custom = None  # the chord shown as an extra entry, if any
         self.updating = False
         self.set_value(value)
@@ -221,9 +255,80 @@ def scale_row(title, subtitle, low, high, step, value, on_change, fmt, default, 
     return row
 
 
+class AppChooser(Adw.Dialog):
+    """Pick an installed app."""
+
+    def __init__(self, on_chosen):
+        super().__init__(title="Add an App", content_width=420, content_height=560)
+        self.on_chosen = on_chosen
+        view = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        view.add_top_bar(header)
+        search = Gtk.SearchEntry(placeholder_text="Search apps", margin_start=12, margin_end=12, margin_bottom=6)
+        view.add_top_bar(search)
+        self.list = Gtk.ListBox(css_classes=["boxed-list"], selection_mode=Gtk.SelectionMode.NONE,
+                                margin_start=12, margin_end=12, margin_top=6, margin_bottom=12)
+        apps = sorted((a for a in Gio.AppInfo.get_all() if a.should_show() and a.get_id()),
+                      key=lambda a: a.get_display_name().lower())
+        for info in apps:
+            row = Adw.ActionRow(title=info.get_display_name(), activatable=True)
+            row.add_prefix(Gtk.Image(gicon=info.get_icon(), pixel_size=32) if info.get_icon()
+                           else Gtk.Image(icon_name="application-x-executable-symbolic", pixel_size=32))
+            row.info = info
+            row.connect("activated", self.on_activated)
+            self.list.append(row)
+        query = {"text": ""}
+        self.list.set_filter_func(lambda row: query["text"] in row.info.get_display_name().lower())
+        search.connect("search-changed", lambda e: (query.__setitem__("text", e.get_text().lower()),
+                                                    self.list.invalidate_filter()))
+        view.set_content(Gtk.ScrolledWindow(child=self.list, vexpand=True))
+        self.set_child(view)
+
+    def on_activated(self, row):
+        self.close()
+        self.on_chosen(row.info)
+
+
+class AppSettings(Adw.Dialog):
+    """One app's overrides of the button and gesture actions."""
+
+    def __init__(self, window, app_id):
+        entry = window.config["apps"][app_id]
+        super().__init__(title=entry.get("name") or app_id, content_width=620, content_height=720)
+        view = Adw.ToolbarView()
+        view.add_top_bar(Adw.HeaderBar())
+        page = Adw.PreferencesPage()
+        state = window.state or {}
+        available = state.get("buttons") or list(config.BUTTONS)
+        movable = state.get("gesture_buttons") or list(config.BUTTONS)
+        overrides = entry.setdefault("buttons", {})
+        for name in config.BUTTONS:
+            if name not in available:
+                continue
+            settings = config.button_settings(window.config, name)
+            mine = overrides.get(name) or {}
+            group = Adw.PreferencesGroup(title=config.BUTTON_LABELS[name])
+
+            def changed(value, n=name, slot="click"):
+                window.set_app_button(app_id, n, slot, value)
+                window.refresh_app_rows()
+
+            group.add(ActionRow(window, "Click", mine.get("click"), changed, None,
+                                inherit=actions.label(settings.get("click", "default"))))
+            if name in movable:
+                for direction in config.DIRECTIONS:
+                    group.add(ActionRow(window, DIRECTION_LABELS[direction], mine.get(direction),
+                                        lambda v, n=name, d=direction: changed(v, n, d), None, direction,
+                                        inherit=actions.label(settings.get(direction), direction)
+                                        if actions.does_something(settings.get(direction)) else "Nothing"))
+            page.add(group)
+        view.set_content(page)
+        self.set_child(view)
+
+
 class Window(Adw.ApplicationWindow):
     def __init__(self, app):
-        super().__init__(application=app, title="MX Master Settings", default_width=760, default_height=820)
+        super().__init__(application=app, title="MX Master Settings", default_width=900, default_height=820)
         self.set_size_request(360, 480)
         self.config = config.load()
         self.state = None
@@ -246,7 +351,7 @@ class Window(Adw.ApplicationWindow):
         view.add_top_bar(self.banner)
         bottom = Adw.ViewSwitcherBar(stack=self.stack)
         view.add_bottom_bar(bottom)
-        breakpoint = Adw.Breakpoint.new(Adw.BreakpointCondition.parse("max-width: 560sp"))
+        breakpoint = Adw.Breakpoint.new(Adw.BreakpointCondition.parse("max-width: 760sp"))
         breakpoint.add_setter(switcher, "visible", False)
         breakpoint.add_setter(bottom, "reveal", True)
         self.add_breakpoint(breakpoint)
@@ -261,14 +366,23 @@ class Window(Adw.ApplicationWindow):
 
     # --- pages ---------------------------------------------------------------
 
+    PAGES = [("buttons", "Buttons", "input-mouse-symbolic"),
+             ("gestures", "Gestures", "input-touchpad-symbolic"),
+             ("ring", "Ring", "view-app-grid-symbolic"),
+             ("apps", "Apps", "applications-system-symbolic"),
+             ("pointer", "Pointer", "find-location-symbolic"),
+             ("assistant", "Assistant", "starred-symbolic")]
+
     def build_pages(self):
-        for name in ("buttons", "gestures", "pointer"):
+        visible = self.stack.get_visible_child_name()
+        for name, *_ in self.PAGES:
             child = self.stack.get_child_by_name(name)
             if child:
                 self.stack.remove(child)
-        self.stack.add_titled_with_icon(self.buttons_page(), "buttons", "Buttons", "input-mouse-symbolic")
-        self.stack.add_titled_with_icon(self.gestures_page(), "gestures", "Gestures", "input-touchpad-symbolic")
-        self.stack.add_titled_with_icon(self.pointer_page(), "pointer", "Pointer", "find-location-symbolic")
+        for name, title, icon in self.PAGES:
+            self.stack.add_titled_with_icon(getattr(self, f"{name}_page")(), name, title, icon)
+        if visible:
+            self.stack.set_visible_child_name(visible)
 
     def device_group(self):
         group = Adw.PreferencesGroup()
@@ -408,6 +522,200 @@ class Window(Adw.ApplicationWindow):
             page.add(group)
         return page
 
+    def shell_notice(self):
+        """A row explaining that the ring and per-app settings need the extension, if it isn't running."""
+        state = self.state or {}
+        if not self.state or state.get("shell"):
+            return None
+        group = Adw.PreferencesGroup()
+        row = Adw.ActionRow(title="The GNOME Shell extension isn't running",
+                            subtitle="It comes with the app. Log out and back in once after installing to start it.")
+        row.add_prefix(Gtk.Image(icon_name="dialog-information-symbolic"))
+        group.add(row)
+        return group
+
+    def ring_page(self):
+        page = Adw.PreferencesPage()
+        if notice := self.shell_notice():
+            page.add(notice)
+        items = self.config.setdefault("ring", list(config.DEFAULTS["ring"]))
+        items += [None] * (actions.RING_SLOTS - len(items))
+        group = Adw.PreferencesGroup(
+            title="Actions ring",
+            description="Set a button's click to “Actions ring” on the Buttons page. Hold the button, "
+                        "move toward an item and let go. Or click it once and pick an item with the pointer.")
+        for i, position in enumerate(actions.RING_POSITIONS):
+            group.add(ActionRow(self, position, items[i], lambda v, i=i: self.set_ring(i, v),
+                                config.DEFAULTS["ring"][i], kind="ring"))
+        page.add(group)
+        return page
+
+    def set_ring(self, index, value):
+        self.config["ring"][index] = value
+        self.save_soon()
+
+    def apps_page(self):
+        page = Adw.PreferencesPage()
+        if notice := self.shell_notice():
+            page.add(notice)
+        group = Adw.PreferencesGroup(
+            title="Per-app settings",
+            description="Give an app its own button and gesture actions. Anything you leave on "
+                        "“Same as everywhere” keeps the settings from the Buttons page.")
+        apps = self.config.setdefault("apps", {})
+        self.app_rows = {}
+        for app_id, entry in sorted(apps.items(), key=lambda kv: kv[1].get("name", kv[0]).lower()):
+            self.app_rows[app_id] = self.app_row(app_id, entry)
+            group.add(self.app_rows[app_id])
+        add = Adw.ButtonRow(title="Add an App…", start_icon_name="list-add-symbolic")
+        add.connect("activated", lambda *_: AppChooser(self.add_app).present(self))
+        group.add(add)
+        page.add(group)
+        return page
+
+    def app_row(self, app_id, entry):
+        row = Adw.ActionRow(title=entry.get("name") or app_id, subtitle=self.app_summary(entry), activatable=True)
+        info = Gio.DesktopAppInfo.new(app_id + ".desktop")
+        row.add_prefix(Gtk.Image(gicon=info.get_icon(), pixel_size=32) if info and info.get_icon()
+                       else Gtk.Image(icon_name="application-x-executable-symbolic", pixel_size=32))
+        remove = Gtk.Button(icon_name="user-trash-symbolic", tooltip_text="Remove", valign=Gtk.Align.CENTER,
+                            css_classes=["flat", "circular"])
+        remove.connect("clicked", lambda *_: self.remove_app(app_id))
+        row.add_suffix(remove)
+        row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
+        row.connect("activated", lambda *_: AppSettings(self, app_id).present(self))
+        return row
+
+    @staticmethod
+    def app_summary(entry):
+        changes = sum(len(slots) for slots in (entry.get("buttons") or {}).values())
+        return f"{changes} change{'s' if changes != 1 else ''}" if changes else "Same as everywhere"
+
+    def add_app(self, info):
+        app_id = info.get_id().removesuffix(".desktop")
+        self.config["apps"].setdefault(app_id, {"name": info.get_display_name(), "buttons": {}})
+        self.save_soon()
+        self.build_pages()
+        AppSettings(self, app_id).present(self)
+
+    def remove_app(self, app_id):
+        entry = self.config["apps"].pop(app_id, None)
+        self.save_soon()
+        self.build_pages()
+        toast = Adw.Toast(title=f"Removed {entry.get('name', app_id)}", button_label="Undo")
+        toast.connect("button-clicked", lambda *_: (self.config["apps"].__setitem__(app_id, entry),
+                                                    self.save_soon(), self.build_pages()))
+        self.toasts.add_toast(toast)
+
+    def refresh_app_rows(self):
+        for app_id, row in self.app_rows.items():
+            if app_id in self.config["apps"]:
+                row.set_subtitle(self.app_summary(self.config["apps"][app_id]))
+
+    def set_app_button(self, app_id, name, slot, value):
+        buttons = self.config["apps"][app_id].setdefault("buttons", {})
+        slots = buttons.setdefault(name, {})
+        if value is None:
+            slots.pop(slot, None)
+            if not slots:
+                buttons.pop(name)
+        else:
+            slots[slot] = value
+        self.save_soon()
+
+    def assistant_page(self):
+        page = Adw.PreferencesPage()
+        assistant = self.config.setdefault("assistant", dict(config.DEFAULTS["assistant"]))
+        defaults = config.DEFAULTS["assistant"]
+        group = Adw.PreferencesGroup(
+            title="AI assistant",
+            description="A small window for ChatGPT, Gemini or Claude. It opens and closes with the "
+                        "“AI assistant” action on a button, a gesture or the actions ring. Closing it only "
+                        "hides it, so your conversation is still there until you log out. Sign-ins are kept.")
+        if not webkit_available():
+            row = Adw.ActionRow(title="Needs WebKitGTK",
+                                subtitle="Install it with: sudo apt install gir1.2-webkit-6.0")
+            row.add_prefix(Gtk.Image(icon_name="dialog-warning-symbolic"))
+            row.set_subtitle_selectable(True)
+            group.add(row)
+        enabled = Adw.SwitchRow(title="Assistant window", subtitle="Off unless you turn it on",
+                                active=bool(assistant.get("enabled")))
+        update_enabled = add_reset(enabled, lambda: enabled.get_active() == defaults["enabled"],
+                                   lambda: enabled.set_active(defaults["enabled"]))
+        group.add(enabled)
+
+        keys = list(config.ASSISTANT_PROVIDERS)
+        provider = Adw.ComboRow(title="Service",
+                                model=Gtk.StringList.new([v[0] for v in config.ASSISTANT_PROVIDERS.values()]))
+        provider.set_selected(keys.index(assistant.get("provider")) if assistant.get("provider") in keys else 0)
+        update_provider = add_reset(provider, lambda: keys[provider.get_selected()] == defaults["provider"],
+                                    lambda: provider.set_selected(keys.index(defaults["provider"])))
+        group.add(provider)
+        address = Adw.EntryRow(title="Address", text=assistant.get("url") or "", show_apply_button=True,
+                               input_purpose=Gtk.InputPurpose.URL)
+        address.connect("apply", lambda r: self.set_value(("assistant", "url"), r.get_text().strip()))
+        group.add(address)
+
+        def sync(*_):
+            on = enabled.get_active()
+            provider.set_sensitive(on)
+            address.set_sensitive(on)
+            address.set_visible(keys[provider.get_selected()] == "custom")
+
+        def on_enabled(*_):
+            self.set_value(("assistant", "enabled"), enabled.get_active())
+            if not enabled.get_active():
+                quit_assistant()
+            update_enabled()
+            sync()
+
+        def on_provider(*_):
+            self.set_value(("assistant", "provider"), keys[provider.get_selected()])
+            quit_assistant()  # opens on the new service next time
+            update_provider()
+            sync()
+
+        enabled.connect("notify::active", on_enabled)
+        provider.connect("notify::selected", on_provider)
+        sync()
+        page.add(group)
+
+        group = Adw.PreferencesGroup()
+        open_row = Adw.ButtonRow(title="Open the Assistant", start_icon_name="starred-symbolic")
+        open_row.connect("activated", self.open_assistant)
+        open_row.set_sensitive(webkit_available())
+        enabled.bind_property("active", open_row, "visible", GObject.BindingFlags.SYNC_CREATE)
+        group.add(open_row)
+        clear = Adw.ButtonRow(title="Sign Out and Clear Data")
+        clear.add_css_class("destructive-action")
+        clear.connect("activated", self.clear_assistant)
+        group.add(clear)
+        page.add(group)
+        return page
+
+    def open_assistant(self, *_):
+        if self.save_source:  # make sure it reads the latest settings
+            GLib.source_remove(self.save_source)
+            self.save()
+        run_assistant()
+
+    def clear_assistant(self, *_):
+        dialog = Adw.AlertDialog(heading="Sign out of the assistant?",
+                                 body="This closes the assistant window and deletes its sign-ins, cookies and cache.")
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("clear", "Sign Out")
+        dialog.set_response_appearance("clear", Adw.ResponseAppearance.DESTRUCTIVE)
+
+        def done(_dialog, response):
+            if response != "clear":
+                return
+            quit_assistant()
+            shutil.rmtree(config.ASSISTANT_DATA, ignore_errors=True)
+            self.toasts.add_toast(Adw.Toast(title="Signed out; assistant data cleared"))
+
+        dialog.connect("response", done)
+        dialog.present(self)
+
     # --- changes -------------------------------------------------------------
 
     def set_button(self, name, slot, value, expander=None):
@@ -432,9 +740,7 @@ class Window(Adw.ApplicationWindow):
         self.config["swipe"] = defaults["swipe"]
         self.config["gesture_threshold"] = defaults["gesture_threshold"]
         self.save_soon()
-        page = self.stack.get_visible_child_name()
         self.build_pages()
-        self.stack.set_visible_child_name(page)
         self.update_device()
         self.toasts.add_toast(Adw.Toast(title="Gesture settings reset"))
 
@@ -475,9 +781,7 @@ class Window(Adw.ApplicationWindow):
         self.state = state
         if first:
             # Now we know which buttons this mouse has and its DPI range
-            page = self.stack.get_visible_child_name()
             self.build_pages()
-            self.stack.set_visible_child_name(page)
         self.update_device()
         return GLib.SOURCE_CONTINUE
 

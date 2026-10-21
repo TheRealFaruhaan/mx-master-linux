@@ -1,0 +1,9 @@
+{
+  "uuid": "mx-master-linux@faruhaan.dev",
+  "name": "MX Master Linux",
+  "description": "Companion for mx-master-linux: draws the actions ring at the pointer, tells the daemon which app has focus for per-app gestures, and keeps the AI assistant window above other windows.",
+  "shell-version": ["46", "47", "48", "49", "50"],
+  "url": "https://github.com/TheRealFaruhaan/mx-master-linux",
+  "version": 1,
+  "version-name": "1.1"
+}
