@@ -41,6 +41,10 @@ cd mx-master-linux
 ./install.sh --uninstall  # removes it (your settings stay in ~/.config/mx-master-linux)
 ```
 
+Or download `mx-master-linux-<version>.tar.gz` from the
+[latest release](https://github.com/TheRealFaruhaan/mx-master-linux/releases/latest), unpack it,
+and run `./install.sh` inside.
+
 Run `install.sh` as your normal user. It asks for `sudo` once to install a udev rule
 (`/etc/udev/rules.d/70-mx-master.rules`) that gives the logged-in user access to the mouse
 and to `/dev/uinput`. Everything else goes into your home folder:

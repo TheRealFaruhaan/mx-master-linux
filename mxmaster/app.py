@@ -10,10 +10,11 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 
-from . import actions, config  # noqa: E402
+from . import __version__, actions, config  # noqa: E402
 from .keycodes import CODES  # noqa: E402
 
 APP_ID = "dev.faruhaan.MxMaster"
+WEBSITE = "https://github.com/TheRealFaruhaan/mx-master-linux"
 SERVICE = "mx-masterd.service"
 SAVE_DELAY_MS = 300
 
@@ -234,6 +235,10 @@ class Window(Adw.ApplicationWindow):
         self.stack = Adw.ViewStack()
         switcher = Adw.ViewSwitcher(stack=self.stack, policy=Adw.ViewSwitcherPolicy.WIDE)
         header.set_title_widget(switcher)
+        menu = Gio.Menu()
+        menu.append("About MX Master Settings", "app.about")
+        header.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu,
+                                       tooltip_text="Main Menu", primary=True))
         view.add_top_bar(header)
         self.banner = Adw.Banner(title="The background service isn't running, so changes won't take effect",
                                  button_label="Start")
@@ -523,6 +528,22 @@ class App(Adw.Application):
         if SOURCE_ICONS.is_dir():
             Gtk.IconTheme.get_for_display(Gdk.Display.get_default()).add_search_path(str(SOURCE_ICONS))
         Gtk.Window.set_default_icon_name(APP_ID)
+        about = Gio.SimpleAction.new("about", None)
+        about.connect("activate", self.show_about)
+        self.add_action(about)
+
+    def show_about(self, *_):
+        Adw.AboutDialog(
+            application_name="MX Master Settings",
+            application_icon=APP_ID,
+            version=__version__,
+            developer_name="Hussain Faruhaan",
+            comments="Button remapping and touchpad-style gestures for Logitech MX Master mice.\n"
+                     "Not affiliated with Logitech.",
+            license_type=Gtk.License.MIT_X11,
+            website=WEBSITE,
+            issue_url=WEBSITE + "/issues",
+        ).present(self.get_active_window())
 
     def do_activate(self):
         window = self.get_active_window() or Window(self)
